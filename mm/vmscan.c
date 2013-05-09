@@ -44,7 +44,6 @@
 #include <linux/oom.h>
 #include <linux/prefetch.h>
 #include <linux/debugfs.h>
-#include <linux/fs.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -90,8 +89,6 @@ struct scan_control {
 	int may_swap;
 
 	int order;
-
-	int swappiness;
 
 	/* Scan (total_size >> priority) pages at once */
 	int priority;
@@ -315,7 +312,7 @@ unsigned long shrink_slab(struct shrink_control *shrink,
 
 	list_for_each_entry(shrinker, &shrinker_list, list) {
 		unsigned long long delta;
-		long total_scan, pages_got;
+		long total_scan;
 		long max_pass;
 		int shrink_ret = 0;
 		long nr;
@@ -388,14 +385,10 @@ unsigned long shrink_slab(struct shrink_control *shrink,
 							batch_size);
 			if (shrink_ret == -1)
 				break;
-			if (shrink_ret < nr_before) {
-				pages_got = nr_before - shrink_ret;
-				ret += pages_got;
-				total_scan -= pages_got > batch_size ? pages_got : batch_size;
-			} else {
-				total_scan -= batch_size;
-			}
+			if (shrink_ret < nr_before)
+				ret += nr_before - shrink_ret;
 			count_vm_events(SLABS_SCANNED, batch_size);
+			total_scan -= batch_size;
 
 			cond_resched();
 		}
@@ -844,8 +837,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			goto keep;
 
 		VM_BUG_ON(PageActive(page));
-		if (zone)
-			VM_BUG_ON(page_zone(page) != zone);
+		VM_BUG_ON(page_zone(page) != zone);
 
 		sc->nr_scanned++;
 
@@ -1009,7 +1001,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			 */
 			if (page_is_file_cache(page) &&
 					(!current_is_kswapd() ||
-				(zone && !zone_is_reclaim_dirty(zone)))) {
+					 !zone_is_reclaim_dirty(zone))) {
 				/*
 				 * Immediately reclaim when written back.
 				 * Similar in principal to deactivate_page()
@@ -1116,13 +1108,6 @@ free_it:
 		 * appear not as the counts should be low
 		 */
 		list_add(&page->lru, &free_pages);
-		/*
-		 * If pagelist are from multiple zones, we should decrease
-		 * NR_ISOLATED_ANON + x on freed pages in here.
-		 */
-		if (!zone)
-			dec_zone_page_state(page, NR_ISOLATED_ANON +
-					page_is_file_cache(page));
 		continue;
 
 cull_mlocked:
@@ -1190,7 +1175,8 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 }
 
 #ifdef CONFIG_PROCESS_RECLAIM
-unsigned long reclaim_pages_from_list(struct list_head *page_list)
+unsigned long reclaim_pages_from_list(struct list_head *page_list,
+					struct vm_area_struct *vma)
 {
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
@@ -1198,6 +1184,7 @@ unsigned long reclaim_pages_from_list(struct list_head *page_list)
 		.may_writepage = 1,
 		.may_unmap = 1,
 		.may_swap = 1,
+		.target_vma = vma,
 	};
 
 	unsigned long nr_reclaimed;
@@ -1413,17 +1400,6 @@ static int __too_many_isolated(struct zone *zone, int file,
 {
 	unsigned long inactive, isolated;
 
-#ifdef CONFIG_RUNTIME_COMPCACHE
-	if (get_rtcc_status() == 1)
-		return 0;
-#endif /* CONFIG_RUNTIME_COMPCACHE */
-
-	if (current_is_kswapd())
-		return 0;
-
-	if (!global_reclaim(sc))
-		return 0;
-
 	if (file) {
 		if (safe) {
 			inactive = zone_page_state_snapshot(zone,
@@ -1467,6 +1443,11 @@ static int __too_many_isolated(struct zone *zone, int file,
 static int too_many_isolated(struct zone *zone, int file,
 		struct scan_control *sc, int safe)
 {
+#ifdef CONFIG_RUNTIME_COMPCACHE
+	if (get_rtcc_status() == 1)
+		return 0;
+#endif /* CONFIG_RUNTIME_COMPCACHE */
+
 	if (current_is_kswapd())
 		return 0;
 
@@ -1947,7 +1928,7 @@ static int vmscan_swappiness(struct scan_control *sc)
 		return sc->rc->swappiness;
 #endif /* CONFIG_RUNTIME_COMPCACHE */
 	if (global_reclaim(sc))
-		return sc->swappiness;
+		return vm_swappiness;
 	return mem_cgroup_swappiness(sc->target_mem_cgroup);
 }
 
@@ -2188,6 +2169,9 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		if (rtcc_reclaim(sc)) {
 			if (rc->nr_swapped >= rc->nr_anon)
 				nr[LRU_INACTIVE_ANON] = nr[LRU_ACTIVE_ANON] = 0;
+
+			if ((sc->nr_reclaimed + nr_reclaimed - rc->nr_swapped) >= rc->nr_file)
+				nr[LRU_INACTIVE_FILE] = nr[LRU_ACTIVE_FILE] = 0;
 		}
 #endif /* CONFIG_RUNTIME_COMPCACHE */
 
@@ -2788,11 +2772,6 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 #else
 		.may_swap = 1,
 #endif /* CONFIG_RUNTIME_COMPCACHE */
-#ifdef CONFIG_ZSWAP
-		.swappiness = vm_swappiness / 2,
-#else
-		.swappiness = vm_swappiness,
-#endif
 		.order = order,
 		.priority = DEF_PRIORITY,
 		.target_mem_cgroup = NULL,
@@ -2835,7 +2814,6 @@ unsigned long mem_cgroup_shrink_node_zone(struct mem_cgroup *memcg,
 		.may_unmap = 1,
 		.may_swap = !noswap,
 		.order = 0,
-		.swappiness = vm_swappiness,
 		.priority = 0,
 		.target_mem_cgroup = memcg,
 	};
@@ -2876,7 +2854,6 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		.may_swap = !noswap,
 		.nr_to_reclaim = SWAP_CLUSTER_MAX,
 		.order = 0,
-		.swappiness = vm_swappiness,
 		.priority = DEF_PRIORITY,
 		.target_mem_cgroup = memcg,
 		.nodemask = NULL, /* we don't care the placement */
@@ -2995,11 +2972,7 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int classzone_idx)
 	}
 
 	if (order)
-#ifdef CONFIG_TIGHT_PGDAT_BALANCE
-		return balanced_pages >= (managed_pages >> 1);
-#else
 		return balanced_pages >= (managed_pages >> 2);
-#endif
 	else
 		return true;
 }
@@ -3148,10 +3121,13 @@ static unsigned long balance_pgdat(pg_data_t *pgdat, int order,
 		.gfp_mask = GFP_KERNEL,
 		.priority = DEF_PRIORITY,
 		.may_unmap = 1,
+#ifndef CONFIG_KSWAPD_NOSWAP
 		.may_swap = 1,
+#else
+		.may_swap = 0,
+#endif /* CONFIG_KSWAPD_NOSWAP */
 		.may_writepage = !laptop_mode,
 		.order = order,
-		.swappiness = vm_swappiness,
 		.target_mem_cgroup = NULL,
 	};
 	count_vm_event(PAGEOUTRUN);
@@ -3352,12 +3328,11 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int order, int classzone_idx)
 	 * go fully to sleep until explicitly woken up.
 	 */
 	if (prepare_kswapd_sleep(pgdat, order, remaining, classzone_idx)) {
+		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
 
 #ifdef CONFIG_RUNTIME_COMPCACHE
 		atomic_set(&kswapd_running, 0);
 #endif /* CONFIG_RUNTIME_COMPCACHE */
-
-		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
 
 		/*
 		 * vmstat counters are not perfectly accurate and the estimated
@@ -3694,7 +3669,6 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 		.nr_to_reclaim = nr_to_reclaim,
 		.hibernation_mode = 1,
 		.order = 0,
-		.swappiness = vm_swappiness,
 		.priority = DEF_PRIORITY,
 	};
 	struct shrink_control shrink = {
@@ -3888,7 +3862,6 @@ static int __zone_reclaim(struct zone *zone, gfp_t gfp_mask, unsigned int order)
 		.nr_to_reclaim = max(nr_pages, SWAP_CLUSTER_MAX),
 		.gfp_mask = (gfp_mask = memalloc_noio_flags(gfp_mask)),
 		.order = order,
-		.swappiness = vm_swappiness,
 		.priority = ZONE_RECLAIM_PRIORITY,
 	};
 	struct shrink_control shrink = {
